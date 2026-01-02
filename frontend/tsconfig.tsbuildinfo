@@ -1,0 +1,1 @@
+{"root":["./src/app.tsx","./src/main.tsx","./src/vite-env.d.ts","./src/api/http.ts","./src/api/rooms.ts","./src/pages/evil.tsx","./src/pages/home.tsx","./src/pages/room.tsx","./src/realtime/socket.ts","./src/storage/profile.ts","./src/types/game.ts","./src/ui/canvasboard.tsx","./src/ui/chatpanel.tsx","./src/ui/playerlist.tsx"],"version":"5.9.3"}
