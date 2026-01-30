@@ -8,12 +8,13 @@ export default function Home() {
   const initial = useMemo(() => loadProfile(), [])
   const [name, setName] = useState(initial.name)
   const [avatar, setAvatar] = useState(initial.avatar)
+  const playerKey = initial.playerKey
   const [roomCode, setRoomCode] = useState('')
   const [busy, setBusy] = useState(false)
   const [err, setErr] = useState('')
 
   function persistProfile() {
-    saveProfile({ name: name.trim() || '游客', avatar: avatar.trim() })
+    saveProfile({ name: name.trim() || '游客', avatar: avatar.trim(), playerKey })
   }
 
   async function onCreate() {
@@ -65,7 +66,7 @@ export default function Home() {
               value={avatar}
               onChange={(e) => setAvatar(e.target.value)}
               onBlur={persistProfile}
-              placeholder="https://... 或 😀"
+              placeholder="QQ号（可选）"
             />
             <div className="text-sm text-slate-400">会保存到 localStorage，其他人可见</div>
           </div>

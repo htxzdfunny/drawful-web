@@ -25,6 +25,7 @@ export default function Room() {
 
   const [roundDurationSecInput, setRoundDurationSecInput] = useState<string>('')
   const [transferOwnerId, setTransferOwnerId] = useState<string>('')
+  const [roundsPerMatchInput, setRoundsPerMatchInput] = useState<string>('')
 
   const [showProfileModal, setShowProfileModal] = useState(false)
   const [editName, setEditName] = useState('')
@@ -38,11 +39,11 @@ export default function Room() {
     }
   })
 
-  const profileReady = !!profile.name.trim() && profile.name.trim() !== '游客' && !!profile.avatar.trim()
+  const profileReady = !!profile.name.trim() && profile.name.trim() !== '游客'
 
   useEffect(() => {
     const initial = loadProfile()
-    if (!initial.name || !initial.avatar) {
+    if (!initial.name) {
       setShowProfileModal(true)
       setEditName(initial.name)
       setEditAvatar(initial.avatar)
@@ -56,6 +57,7 @@ export default function Room() {
     if (!room) return
     setRoundDurationSecInput(String(room.roundDurationSec ?? ''))
     setTransferOwnerId('')
+    setRoundsPerMatchInput(String((room as any).roundsPerMatch ?? ''))
   }, [room?.code, room?.roundDurationSec, room?.ownerId])
 
   useEffect(() => {
@@ -64,7 +66,7 @@ export default function Room() {
     const onConnect = () => {
       setSocketId(s.id || '')
       if (!profileReady) return
-      s.emit('room:join', { roomCode, name: profile.name, avatar: profile.avatar })
+      s.emit('room:join', { roomCode, name: profile.name, avatar: profile.avatar, playerKey: profile.playerKey })
     }
 
     const onRoomState = (payload: RoomState) => {
@@ -157,6 +159,7 @@ export default function Room() {
   const isDrawer = !!room && room.drawerId === socketId
   const canDraw = !!room && room.state === 'playing' && isDrawer
   const canAbort = !!room && (room.state === 'choosing' || room.state === 'playing')
+  const canAbortMatch = !!room && room.state !== 'lobby'
 
   const currentPlayerName = useMemo(() => {
     if (!room) return ''
@@ -184,7 +187,7 @@ export default function Room() {
     if (/^\d{5,12}$/.test(a)) {
       return `https://q1.qlogo.cn/g?b=qq&nk=${a}&s=640`
     }
-    return a
+    return ''
   }
 
   function saveCustomWords(text: string) {
@@ -231,6 +234,55 @@ export default function Room() {
     }
   }
 
+  function onAbortMatch() {
+    if (!canAbortMatch) return
+    const s = getSocket()
+    if (isOwner) {
+      let done = false
+      const t = window.setTimeout(() => {
+        if (done) return
+        setErr('timeout')
+        setToast('操作超时：后端未响应（请确认已更新后端并重启服务）')
+        if (toastTimerRef.current) window.clearTimeout(toastTimerRef.current)
+        toastTimerRef.current = window.setTimeout(() => setToast(''), 2500)
+      }, 1500)
+      s.emit('game:abort_match', { roomCode }, (ack: any) => {
+        done = true
+        window.clearTimeout(t)
+        if (!ack?.ok) {
+          setErr(String(ack?.error || 'abort_match_failed'))
+          return
+        }
+        setErr('')
+      })
+    } else {
+      let done = false
+      const t = window.setTimeout(() => {
+        if (done) return
+        setErr('timeout')
+        setToast('操作超时：后端未响应（请确认已更新后端并重启服务）')
+        if (toastTimerRef.current) window.clearTimeout(toastTimerRef.current)
+        toastTimerRef.current = window.setTimeout(() => setToast(''), 2500)
+      }, 1500)
+      s.emit('game:abort_match_vote', { roomCode }, (ack: any) => {
+        done = true
+        window.clearTimeout(t)
+        if (!ack?.ok) {
+          setErr(String(ack?.error || 'abort_match_vote_failed'))
+          return
+        }
+        setErr('')
+      })
+    }
+  }
+
+  function onEditProfileInRoom() {
+    const p = loadProfile()
+    setEditName(p.name)
+    setEditAvatar(p.avatar)
+    setShowProfileModal(true)
+  }
+
   function onStartGame() {
     if (!room) return
     if (!isOwner) return
@@ -266,6 +318,38 @@ export default function Room() {
       }
       setErr('')
       setToast('已保存回合时长')
+      if (toastTimerRef.current) window.clearTimeout(toastTimerRef.current)
+      toastTimerRef.current = window.setTimeout(() => setToast(''), 1500)
+    })
+  }
+
+  function onSaveRoundsPerMatch() {
+    if (!room) return
+    if (!isOwner) return
+    if (room.state !== 'lobby') return
+    const n = Number(roundsPerMatchInput)
+    if (!Number.isFinite(n)) {
+      setErr('invalid_rounds')
+      return
+    }
+    const s = getSocket()
+    let done = false
+    const t = window.setTimeout(() => {
+      if (done) return
+      setErr('timeout')
+      setToast('操作超时：后端未响应（请确认已更新后端并重启服务）')
+      if (toastTimerRef.current) window.clearTimeout(toastTimerRef.current)
+      toastTimerRef.current = window.setTimeout(() => setToast(''), 2500)
+    }, 1500)
+    s.emit('room:set_rounds_per_match', { roomCode, roundsPerMatch: Math.trunc(n) }, (ack: any) => {
+      done = true
+      window.clearTimeout(t)
+      if (!ack?.ok) {
+        setErr(String(ack?.error || 'invalid_rounds'))
+        return
+      }
+      setErr('')
+      setToast('已保存回合数')
       if (toastTimerRef.current) window.clearTimeout(toastTimerRef.current)
       toastTimerRef.current = window.setTimeout(() => setToast(''), 1500)
     })
@@ -328,6 +412,9 @@ export default function Room() {
               你：{currentPlayerName || socketId || '未连接'}
               {room?.wordHint ? ` | 词条：${room.wordHint}（${room.wordHint.length}个字）` : ''}
               {room?.word ? ` | 你是画手，答案：${room.word}` : ''}
+              {room?.matchRoundIndex && room?.roundsPerMatch
+                ? ` | 本局回合：${room.matchRoundIndex}/${room.roundsPerMatch}`
+                : ''}
               {room?.state ? ` | 状态：${room.state}` : ''}
               {room?.state === 'choosing' && room?.chooseEndsAtMs
                 ? ` | 选词倒计时：${remainingSec(room.chooseEndsAtMs)}s`
@@ -341,6 +428,14 @@ export default function Room() {
             </div>
           </div>
           <div className="flex items-center gap-2">
+            <button
+              className="rounded-lg bg-slate-800 px-3 py-2 text-sm font-semibold disabled:cursor-not-allowed disabled:opacity-60"
+              onClick={onEditProfileInRoom}
+              disabled={!room}
+              title={!room ? '未连接' : '修改昵称/头像（房内生效）'}
+            >
+              修改资料
+            </button>
             <button
               className="rounded-lg bg-slate-800 px-3 py-2 text-sm font-semibold"
               onClick={() => navigate('/', { replace: true })}
@@ -359,11 +454,22 @@ export default function Room() {
               className="rounded-lg bg-rose-600 px-3 py-2 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:opacity-60"
               onClick={onAbortRound}
               disabled={!room || !canAbort}
-              title={!room ? '' : !canAbort ? '仅回合中可用' : isOwner ? '房主可直接终止本回合' : '投票终止本回合（>2/3 同意自动终止）'}
+              title={!room ? '' : !canAbort ? '仅回合中可用' : isOwner ? '房主可直接终止本回合' : '投票终止本回合（>3/5 同意自动终止）'}
             >
               {isOwner ? '终止回合' : '投票终止'}
               {room && room.abortVotesCount != null && room.abortVotesNeeded != null
                 ? `（${room.abortVotesCount}/${room.abortVotesNeeded}）`
+                : ''}
+            </button>
+            <button
+              className="rounded-lg bg-rose-700 px-3 py-2 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:opacity-60"
+              onClick={onAbortMatch}
+              disabled={!room || !canAbortMatch}
+              title={!room ? '' : !canAbortMatch ? '仅对局中可用' : isOwner ? '房主可直接终止本局' : '投票终止本局（>3/5 同意自动终止）'}
+            >
+              {isOwner ? '终止本局' : '投票终止本局'}
+              {room && (room as any).matchAbortVotesCount != null && (room as any).matchAbortVotesNeeded != null
+                ? `（${(room as any).matchAbortVotesCount}/${(room as any).matchAbortVotesNeeded}）`
                 : ''}
             </button>
             <button
@@ -398,6 +504,27 @@ export default function Room() {
                   保存
                 </button>
                 <div className="text-xs text-slate-400">范围：10-300</div>
+              </div>
+            </div>
+
+            <div className="rounded-xl border border-slate-800 bg-slate-900/40 p-3">
+              <div className="text-sm font-semibold">本局回合数</div>
+              <div className="mt-2 flex flex-wrap items-center gap-2">
+                <input
+                  className="w-28 rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm outline-none focus:border-slate-500"
+                  value={roundsPerMatchInput}
+                  onChange={(e) => setRoundsPerMatchInput(e.target.value)}
+                  placeholder="3"
+                  disabled={room.state !== 'lobby'}
+                />
+                <button
+                  className="rounded-lg bg-slate-800 px-3 py-2 text-sm font-semibold disabled:opacity-60"
+                  onClick={onSaveRoundsPerMatch}
+                  disabled={!roundsPerMatchInput.trim() || room.state !== 'lobby'}
+                >
+                  保存
+                </button>
+                <div className="text-xs text-slate-400">范围：1-20（仅 lobby 可改）</div>
               </div>
             </div>
 
@@ -483,7 +610,7 @@ export default function Room() {
       {showProfileModal ? (
         <div className="fixed inset-0 z-50 grid place-items-center bg-black/60 p-4">
           <div className="w-full max-w-md rounded-xl border border-slate-800 bg-slate-950 p-4">
-            <div className="text-lg font-bold">进入房间前请设置资料</div>
+            <div className="text-lg font-bold">{room ? '修改资料' : '进入房间前请设置资料'}</div>
             <div className="mt-3 grid gap-3">
               <div className="grid gap-1">
                 <div className="text-sm text-slate-300">昵称</div>
@@ -500,28 +627,54 @@ export default function Room() {
                   className="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 outline-none focus:border-slate-500"
                   value={editAvatar}
                   onChange={(e) => setEditAvatar(e.target.value)}
-                  placeholder="例如：12345678 或 https://... 或 😀"
+                  placeholder="QQ号（可选）"
                 />
-                {editAvatar.trim() ? (
+                {previewAvatarUrl(editAvatar) ? (
                   <img src={previewAvatarUrl(editAvatar)} alt="avatar" className="mt-2 h-12 w-12 rounded-full" />
                 ) : null}
               </div>
               <div className="flex items-center justify-end gap-2">
                 <button
                   className="rounded-lg bg-indigo-500 px-4 py-2 font-semibold text-white disabled:opacity-60"
-                  disabled={!editName.trim() || !editAvatar.trim()}
+                  disabled={!editName.trim()}
                   onClick={() => {
-                    saveProfile({ name: editName.trim(), avatar: editAvatar.trim() })
+                    const next = { name: editName.trim(), avatar: editAvatar.trim(), playerKey: profile.playerKey }
+                    saveProfile(next)
                     const p = loadProfile()
                     setProfile(p)
-                    setShowProfileModal(false)
                     const s = getSocket()
+                    if (room && s.connected) {
+                      let done = false
+                      const t = window.setTimeout(() => {
+                        if (done) return
+                        setErr('timeout')
+                        setToast('操作超时：后端未响应（请确认已更新后端并重启服务）')
+                        if (toastTimerRef.current) window.clearTimeout(toastTimerRef.current)
+                        toastTimerRef.current = window.setTimeout(() => setToast(''), 2500)
+                      }, 1500)
+                      s.emit('profile:update', { roomCode, name: p.name, avatar: p.avatar, playerKey: p.playerKey }, (ack: any) => {
+                        done = true
+                        window.clearTimeout(t)
+                        if (!ack?.ok) {
+                          setErr(String(ack?.error || 'profile_update_failed'))
+                          return
+                        }
+                        setErr('')
+                        setShowProfileModal(false)
+                        setToast('资料已更新')
+                        if (toastTimerRef.current) window.clearTimeout(toastTimerRef.current)
+                        toastTimerRef.current = window.setTimeout(() => setToast(''), 1500)
+                      })
+                      return
+                    }
+
+                    setShowProfileModal(false)
                     if (s.connected) {
-                      s.emit('room:join', { roomCode, name: p.name, avatar: p.avatar })
+                      s.emit('room:join', { roomCode, name: p.name, avatar: p.avatar, playerKey: p.playerKey })
                     }
                   }}
                 >
-                  保存并进入
+                  {room ? '保存' : '保存并进入'}
                 </button>
               </div>
             </div>

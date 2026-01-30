@@ -5,7 +5,7 @@
     "dev": "concurrently -n backend,frontend -c blue,green \"python -m backend.app\" \"npm --prefix frontend run dev\"",
     "dev:lan": "concurrently -n backend,frontend -c blue,green \"python -m backend.app\" \"npm --prefix frontend run dev -- --host 0.0.0.0\"",
     "build": "npm --prefix frontend run build",
-    "release": "npm --prefix frontend run build && node scripts/release.mjs",
+    "release": "pnpm --prefix frontend run build && node scripts/release.mjs",
     "frontend:dev": "npm --prefix frontend run dev",
     "frontend:build": "npm --prefix frontend run build"
   },

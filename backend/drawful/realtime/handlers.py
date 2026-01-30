@@ -26,6 +26,29 @@ def _contains_answer(text: str, answer: str) -> bool:
     return a in _normalize_text(text)
 
 
+def _validate_name(name: str) -> bool:
+    n = (name or "").strip()
+    if not n:
+        return False
+    if len(n) > 16:
+        return False
+    # Avoid obvious HTML/script injection.
+    if "<" in n or ">" in n:
+        return False
+    # No control characters.
+    for ch in n:
+        if ord(ch) < 32:
+            return False
+    return True
+
+
+def _normalize_avatar(raw: str) -> str:
+    a = (raw or "").strip()
+    if re.fullmatch(r"\d{5,12}", a):
+        return f"https://q1.qlogo.cn/g?b=qq&nk={a}&s=640"
+    return ""
+
+
 def register_socketio_handlers(socketio: SocketIO) -> None:
     def _broadcast_room_state(room_code: str) -> None:
         room = service.get_room(room_code)
@@ -43,6 +66,12 @@ def register_socketio_handlers(socketio: SocketIO) -> None:
         if room.drawer_id:
             private_state = service.room_public_state(room, viewer_socket_id=room.drawer_id)
             socketio.emit("room:state", private_state, to=room.drawer_id)
+
+    def _safe_broadcast_room_state(room_code: str) -> None:
+        try:
+            _broadcast_room_state(room_code)
+        except Exception:
+            return
 
     def _append_chat(room, msg: dict) -> None:
         try:
@@ -79,7 +108,17 @@ def register_socketio_handlers(socketio: SocketIO) -> None:
             room.players[room.drawer_id].score += 5
 
         emit("guess:correct", {"roomCode": room_code, "by": guesser_socket_id}, to=room_code)
-        _broadcast_room_state(room_code)
+        # If all non-drawer players have guessed, end the round immediately.
+        try:
+            if room.state == "playing" and room.drawer_id:
+                non_drawers = [pid for pid in room.players.keys() if pid != room.drawer_id]
+                if non_drawers and all(pid in room.correct_guessers for pid in non_drawers):
+                    service.reveal_round(room)
+                    socketio.emit("game:reveal", {"roomCode": room_code, "word": room.word}, to=room_code)
+        except Exception:
+            pass
+
+        _safe_broadcast_room_state(room_code)
         return
 
     def _ensure_room_task(room_code: str) -> None:
@@ -96,21 +135,32 @@ def register_socketio_handlers(socketio: SocketIO) -> None:
 
                 now = service.now_ms()
 
+                # Auto-destroy empty room after TTL (10s)
+                try:
+                    if not room.players:
+                        if room.last_empty_at_ms is None:
+                            room.last_empty_at_ms = now
+                        elif now - room.last_empty_at_ms >= 10_000:
+                            service.delete_room(room_code)
+                            break
+                except Exception:
+                    pass
+
                 # Choosing timeout -> auto choose first
                 if room.state == "choosing" and room.choose_ends_at_ms and now >= room.choose_ends_at_ms:
                     service.auto_choose_if_needed(room)
-                    _broadcast_room_state(room_code)
+                    _safe_broadcast_room_state(room_code)
 
                 # Playing timeout -> reveal
                 if room.state == "playing" and room.round_ends_at_ms and now >= room.round_ends_at_ms:
                     service.reveal_round(room)
                     socketio.emit("game:reveal", {"roomCode": room_code, "word": room.word}, to=room_code)
-                    _broadcast_room_state(room_code)
+                    _safe_broadcast_room_state(room_code)
 
                 # Reveal timeout -> back to lobby
                 if room.state == "reveal" and room.reveal_ends_at_ms and now >= room.reveal_ends_at_ms:
-                    service.reset_to_lobby(room)
-                    _broadcast_room_state(room_code)
+                    service.advance_after_reveal(room)
+                    _safe_broadcast_room_state(room_code)
 
                 # Tick (once per second)
                 sec = int(now / 1000)
@@ -131,21 +181,52 @@ def register_socketio_handlers(socketio: SocketIO) -> None:
         room_code = str(payload.get("roomCode", "")).strip()
         name = str(payload.get("name", "")).strip()
         avatar = str(payload.get("avatar", "")).strip()
+        player_key = str(payload.get("playerKey", "")).strip()
 
-        if not room_code or not name:
+        if not room_code or not _validate_name(name):
             emit("room:error", {"error": "invalid_payload"})
             return
+
+        avatar = _normalize_avatar(avatar)
 
         room = service.get_room(room_code)
         if not room:
             emit("room:error", {"error": "room_not_found"})
             return
 
-        if room.owner_id == "rest":
+        # If the room only has a single ghost owner (e.g. old clients without playerKey),
+        # allow the joining user to reclaim ownership.
+        if player_key and room.owner_id in room.players and len(room.players) == 1:
+            try:
+                owner_p = room.players.get(room.owner_id)
+                if owner_p and not getattr(owner_p, "player_key", "") and room.owner_id != request.sid:
+                    try:
+                        del room.players[room.owner_id]
+                    except Exception:
+                        pass
+                    room.owner_id = request.sid
+            except Exception:
+                pass
+
+        if room.owner_id == "rest" or not room.players:
             room.owner_id = request.sid
 
         join_room(room_code)
-        service.upsert_player(room, request.sid, name=name, avatar=avatar)
+        
+        # Store old owner_id before upsert (for playerKey migration)
+        old_owner_id = room.owner_id
+        
+        service.upsert_player(room, request.sid, name=name, avatar=avatar, player_key=player_key)
+
+        # Ensure owner_id always points to a connected player (fix solo-owner leave/rejoin).
+        # Priority: 1) keep old owner if migrated via playerKey, 2) assign to current if rest/invalid
+        if room.owner_id == "rest" or room.owner_id not in room.players:
+            room.owner_id = request.sid
+        elif old_owner_id != "rest" and old_owner_id not in room.players and player_key:
+            # Old owner disconnected but this is a reconnect via playerKey - reclaim ownership
+            old_pk = room.player_key_index.get(player_key)
+            if old_pk == request.sid:
+                room.owner_id = request.sid
 
         # Sync history to the joining client for reconnects / late joiners.
         draw_hist = getattr(room, "draw_history", [])
@@ -154,7 +235,38 @@ def register_socketio_handlers(socketio: SocketIO) -> None:
         emit("chat:sync", {"roomCode": room_code, "messages": getattr(room, "chat_history", [])}, to=request.sid)
 
         _ensure_room_task(room_code)
-        _broadcast_room_state(room_code)
+        _safe_broadcast_room_state(room_code)
+
+    @socketio.on("profile:update")
+    def profile_update(data):
+        payload = data or {}
+        room_code = str(payload.get("roomCode", "")).strip()
+        name = str(payload.get("name", "")).strip()
+        avatar = str(payload.get("avatar", "")).strip()
+        player_key = str(payload.get("playerKey", "")).strip()
+
+        if not room_code:
+            emit("room:error", {"error": "invalid_room"})
+            return {"ok": False, "error": "invalid_room"}
+
+        if not _validate_name(name):
+            emit("room:error", {"error": "invalid_payload"})
+            return {"ok": False, "error": "invalid_payload"}
+
+        avatar = _normalize_avatar(avatar)
+
+        room = service.get_room(room_code)
+        if not room:
+            emit("room:error", {"error": "room_not_found"})
+            return {"ok": False, "error": "room_not_found"}
+
+        if request.sid not in room.players:
+            emit("room:error", {"error": "not_in_room"})
+            return {"ok": False, "error": "not_in_room"}
+
+        service.upsert_player(room, request.sid, name=name, avatar=avatar, player_key=player_key)
+        _safe_broadcast_room_state(room_code)
+        return {"ok": True}
 
     @socketio.on("room:leave")
     def room_leave(data):
@@ -169,7 +281,7 @@ def register_socketio_handlers(socketio: SocketIO) -> None:
 
         leave_room(room_code)
         service.remove_player(room, request.sid)
-        _broadcast_room_state(room_code)
+        _safe_broadcast_room_state(room_code)
 
     @socketio.on("room:set_round_duration")
     def room_set_round_duration(data):
@@ -200,7 +312,41 @@ def register_socketio_handlers(socketio: SocketIO) -> None:
             emit("room:error", {"error": "invalid_duration"})
             return {"ok": False, "error": "invalid_duration"}
 
-        _broadcast_room_state(room_code)
+        _safe_broadcast_room_state(room_code)
+        return {"ok": True}
+
+    @socketio.on("room:set_rounds_per_match")
+    def room_set_rounds_per_match(data):
+        print(f"[DEBUG] room:set_rounds_per_match received from {request.sid}")
+        payload = data or {}
+        room_code = str(payload.get("roomCode", "")).strip()
+        rounds_raw: Any = payload.get("roundsPerMatch")
+        print(f"[DEBUG] room_code={room_code}, rounds_raw={rounds_raw}")
+        if not room_code:
+            emit("room:error", {"error": "invalid_room"})
+            return {"ok": False, "error": "invalid_room"}
+
+        room = service.get_room(room_code)
+        if not room:
+            emit("room:error", {"error": "room_not_found"})
+            return {"ok": False, "error": "room_not_found"}
+
+        if request.sid != room.owner_id:
+            emit("room:error", {"error": "only_owner"})
+            return {"ok": False, "error": "only_owner"}
+
+        try:
+            rpm = int(rounds_raw)
+        except Exception:
+            emit("room:error", {"error": "invalid_rounds"})
+            return {"ok": False, "error": "invalid_rounds"}
+
+        ok = service.set_rounds_per_match(room, rpm)
+        if not ok:
+            emit("room:error", {"error": "invalid_rounds"})
+            return {"ok": False, "error": "invalid_rounds"}
+
+        _safe_broadcast_room_state(room_code)
         return {"ok": True}
 
     @socketio.on("room:transfer_owner")
@@ -226,7 +372,7 @@ def register_socketio_handlers(socketio: SocketIO) -> None:
             emit("room:error", {"error": "invalid_target"})
             return {"ok": False, "error": "invalid_target"}
 
-        _broadcast_room_state(room_code)
+        _safe_broadcast_room_state(room_code)
         return {"ok": True}
 
     @socketio.on("draw:excalidraw_change")
@@ -366,7 +512,7 @@ def register_socketio_handlers(socketio: SocketIO) -> None:
 
         service.abort_round(room)
         socketio.emit("game:reveal", {"roomCode": room_code, "word": room.word}, to=room_code)
-        _broadcast_room_state(room_code)
+        _safe_broadcast_room_state(room_code)
 
     @socketio.on("game:abort_vote")
     def game_abort_vote(data):
@@ -382,7 +528,49 @@ def register_socketio_handlers(socketio: SocketIO) -> None:
         votes, needed, aborted = service.add_abort_vote(room, voter_socket_id=request.sid)
         if aborted:
             socketio.emit("game:reveal", {"roomCode": room_code, "word": room.word}, to=room_code)
-        _broadcast_room_state(room_code)
+        _safe_broadcast_room_state(room_code)
+
+    @socketio.on("game:abort_match")
+    def game_abort_match(data):
+        print(f"[DEBUG] game:abort_match received from {request.sid}")
+        payload = data or {}
+        room_code = str(payload.get("roomCode", "")).strip()
+        print(f"[DEBUG] room_code={room_code}")
+        if not room_code:
+            emit("game:error", {"error": "invalid_room"})
+            return {"ok": False, "error": "invalid_room"}
+
+        room = service.get_room(room_code)
+        if not room:
+            emit("game:error", {"error": "room_not_found"})
+            return {"ok": False, "error": "room_not_found"}
+
+        if request.sid != room.owner_id:
+            emit("game:error", {"error": "only_owner"})
+            return {"ok": False, "error": "only_owner"}
+
+        service.abort_match(room)
+        _safe_broadcast_room_state(room_code)
+        return {"ok": True}
+
+    @socketio.on("game:abort_match_vote")
+    def game_abort_match_vote(data):
+        print(f"[DEBUG] game:abort_match_vote received from {request.sid}")
+        payload = data or {}
+        room_code = str(payload.get("roomCode", "")).strip()
+        print(f"[DEBUG] room_code={room_code}")
+        if not room_code:
+            emit("game:error", {"error": "invalid_room"})
+            return {"ok": False, "error": "invalid_room"}
+
+        room = service.get_room(room_code)
+        if not room:
+            emit("game:error", {"error": "room_not_found"})
+            return {"ok": False, "error": "room_not_found"}
+
+        votes, needed, aborted = service.add_match_abort_vote(room, voter_socket_id=request.sid)
+        _safe_broadcast_room_state(room_code)
+        return {"ok": True, "votes": votes, "needed": needed, "aborted": aborted}
 
     @socketio.on("game:start")
     def game_start(data):
@@ -413,8 +601,8 @@ def register_socketio_handlers(socketio: SocketIO) -> None:
             pass
         socketio.emit("draw:clear", {"roomCode": room_code}, to=room_code)
 
-        service.start_round(room, custom_words=custom_words)
-        _broadcast_room_state(room_code)
+        service.start_match(room, custom_words=custom_words)
+        _safe_broadcast_room_state(room_code)
         _ensure_room_task(room_code)
 
     @socketio.on("game:choose_word")
@@ -443,4 +631,7 @@ def register_socketio_handlers(socketio: SocketIO) -> None:
         for r in service.list_rooms():
             if request.sid in r.players:
                 service.remove_player(r, request.sid)
-                _broadcast_room_state(r.code)
+                # If the disconnected player was the owner, reassign to first remaining player
+                if r.owner_id == request.sid and r.players:
+                    r.owner_id = next(iter(r.players.keys()))
+                _safe_broadcast_room_state(r.code)

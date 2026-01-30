@@ -11,6 +11,8 @@ export type RoomState = {
   ownerId: string
   state: 'lobby' | 'choosing' | 'playing' | 'reveal'
   round: number
+  roundsPerMatch?: number
+  matchRoundIndex?: number
   drawerId: string | null
   roundDurationSec: number
   startedAtMs: number | null
@@ -21,6 +23,8 @@ export type RoomState = {
   wordHint: string | null
   abortVotesCount?: number
   abortVotesNeeded?: number
+  matchAbortVotesCount?: number
+  matchAbortVotesNeeded?: number
   word?: string
   wordChoices?: string[]
 }
