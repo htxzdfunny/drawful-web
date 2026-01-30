@@ -34,7 +34,7 @@ export default function PlayerList({
                       <span>{p.avatar}</span>
                     )
                   ) : (
-                    <span>?</span>
+                    <span>{(p.name || '?').slice(0, 1)}</span>
                   )}
                 </div>
                 <div>
